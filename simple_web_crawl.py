@@ -2,7 +2,6 @@
 import asyncio
 import os
 import re
-import time
 from crawl4ai import CrawlerRunConfig, AsyncWebCrawler
 from crawl4ai.content_scraping_strategy import LXMLWebScrapingStrategy
 from util import url2fname
@@ -41,8 +40,109 @@ config = CrawlerRunConfig(
     # Media filtering
     exclude_external_images=False,
 )
+import re
+
+def _kewpie_fix_markdown_table_linebreaks(markdown_text):
+    """Fix line breaks in markdown tables
+    <br>タグなどで改行されてしまったテーブルのセルを結合する。
+    例えば、以下のようなケースを修正する。
+    [修正前]
+        卵（Mサイズ） | 2個 | 100g  
+        ---|---|---  
+        A 顆粒和風だし | 小さじ  
+        1/5 |   
+        A 水 |  | 45ml  
+        A うすくちしょうゆ | 小さじ  
+        1/2 |   
+    [修正後]
+        卵（Mサイズ） | 2個 | 100g  
+        ---|---|---  
+        A 顆粒和風だし | 小さじ 1/5 |   
+        A 水 |  | 45ml  
+        A うすくちしょうゆ | 小さじ 1/2 |   
+    """
+    lines = markdown_text.split('\n')
+    fixed_lines = []
+    
+    for i, line in enumerate(lines):
+        # Check if this line is part of a table (contains |)
+        if not line:
+            continue
+        if '|' in line:
+            # Check if the next line is also part of the same table row
+            # (doesn't start with |--- or blank)
+            if i + 1 < len(lines):
+                next_line = lines[i + 1]
+                if re.search(r'[^ ]  $', line) and not line.startswith('---'):
+                    if '|' in next_line and  re.search(r'[^ ]   $', next_line) and not next_line.startswith('---') and not next_line.startswith('|') and not next_line.startswith('A |'):
+                    
+                        # Merge with next line
+                        line = line.rstrip() + ' ' + next_line.strip()
+                        lines[i + 1] = None  # Clear the next line
+        
+        if line:  # Only add non-empty lines
+            fixed_lines.append(line)
+    
+    return '\n'.join(fixed_lines)
+
+def _kewpie_fix_table_markdown(md_text):
+    """ Fix markdown tables from kewpie site where some rows have missing columns.
+        材料セクションのテーブルの列数を揃える。"A"が列の先頭に存在するため、Craawl4AIのテーブル抽出ロジックが正しく列数を認識できないため。
+    """
+    # Split into lines
+    lines = md_text.split('\n')
+    
+    # Find table sections (lines with |)
+    table_lines = [l for l in lines if '|' in l]
+    print(f"Found {len(table_lines)} table lines.") 
+    if not table_lines:
+        return md_text
+    
+    ingredients_section = False
+    max_cols = 0
+    for line in lines:
+        if line.startswith('### 材料'):
+            ingredients_section = True
+            continue  # Skip this line
+        
+        if ingredients_section:
+            if '|' in line:
+                cells = [c.strip() for c in line.split('|')]
+                if len(cells) > max_cols:
+                    max_cols = len(cells)
+            else:
+                ingredients_section = False
 
 
+    # print(f"Max columns in ingredients table: {max_cols}")
+
+
+
+    # Rebuild with consistent columns
+    fixed_lines = []
+    ingredients_section = False
+    for line in lines:
+        if line.startswith('### 材料'):
+            ingredients_section = True
+            fixed_lines.append(line)
+            continue  # Skip this line
+        
+        if ingredients_section:
+            if '|' in line:
+                cells = [c.strip() for c in line.split('|')]
+                # print(f"Original cells: {cells}")
+                # Pad to max_cols + 2 (for leading/trailing |)
+                # while len(cells) < max_cols + 2:
+                while len(cells) < max_cols + 1:
+                    cells.append('')
+                fixed_lines.append('| ' + ' | '.join(cells[1:-1]) + ' |')
+            else:
+                ingredients_section = False
+                fixed_lines.append(line)
+        else:
+            fixed_lines.append(line)
+    
+    return '\n'.join(fixed_lines)
 
 def fix_multiline_table_cells(markdown_text: str) -> str:
     """ Fix multiline table cells by merging lines that are part of the same cell.
@@ -86,6 +186,8 @@ def fix_multiline_table_cells(markdown_text: str) -> str:
     
     return '\n'.join(result_lines)
 
+
+
 def remove_javascript_void_zero(markdown_text: str) -> str:
     """ Remove '(javascript:void(0);)' or '(javascript:void(0))' from the content.
     idやclass属性が指定されていないaタグなどに取得すべき文字列が含まれることがあるため、
@@ -114,16 +216,38 @@ def adjust_numbered_lists(markdown_text: str) -> str:
         leading_space = line[:len(line) - len(stripped)]
         
         # Pattern: starts with digit(s), no dot/space after, followed by content
-        match = re.match(r'^(\d+)([^\.\s])', stripped, re.ASCII)
+        matched = re.match(r'^(\d+)([^\.\s/\+\-*%\^<>\[\]\(\)])', stripped, re.ASCII)
         
-        if match:
-            number = match.group(1)
+        if matched:
+            number = matched.group(1)
             rest = stripped[len(number):]
             adjusted_line = f"{leading_space}{number}. {rest}"
             adjusted_lines.append(adjusted_line)
         else:
             adjusted_lines.append(line)
     return '\n'.join(adjusted_lines)
+
+def adjust_markdown(markdown: str) -> str:
+                        # adjust_numbered_lists(
+                        #     remove_javascript_void_zero(
+                        #         fix_markdown_table_linebreaks(
+                        #             kewpie_fix_table_markdown(
+                        #                     fix_markdown_table_linebreaks(result.markdown)
+                        #             )
+                        #         )
+                        #     )
+                        # )
+
+
+    list_of_functions = [
+        _kewpie_fix_markdown_table_linebreaks,
+        _kewpie_fix_table_markdown,
+        remove_javascript_void_zero,
+        adjust_numbered_lists,
+    ]
+    for func in list_of_functions:
+        markdown = func(markdown)
+    return markdown
 
 async def crawl(input_file='urls.txt', output_dir='output_crawled'):
     """Crawl the URLs from the input file and save the results to the output directory."""
@@ -165,37 +289,43 @@ async def crawl(input_file='urls.txt', output_dir='output_crawled'):
                 # mdディレクトリへメタデータを保存
                 with open("{}/md/{}".format(output_dir, url2fname(url) + ".meta"), "w", encoding="utf-8") as file:
                     file.write(json.dumps(meta_data, ensure_ascii=False))
-                # mdディレクトリへマークダウンを保存
+
+                # mdディレクトリへ加工後のマークダウンを保存
                 with open("{}/md/{}".format(output_dir, url2fname(url) + ".md"), "w") as file:
                     file.write(
-                        # fix_multiline_table_cells(
-                            adjust_numbered_lists(remove_javascript_void_zero(result.markdown))
-                        # )
+                        adjust_markdown(result.markdown)
                     )
                 # Unspan tables
                 unspanner = TableUnspanner(result.html)
                 result_list = []
                 # Get all tables as markdown
                 all_tables = unspanner.get_all_tables()
-                for i, table in enumerate(all_tables):
-                    markdown = unspanner.to_markdown_compact(table_index=i, header_row=0)
-                    result_list.append(f"Table {i+1}:\n{markdown}\n\n\n\n")            
+                for j, table in enumerate(all_tables):
+                    markdown = unspanner.to_markdown_compact(table_index=j, header_row=0)
+                    result_list.append(f"Table {j+1}:\n{markdown}\n\n\n\n")            
 
-                # mdディレクトリへマークダウンを保存
+                # mdディレクトリへmarkdownテーブル(colspan/rowspanを展開したもの)を保存
                 if len(result_list) > 0:
                     with open("{}/md/{}".format(output_dir, url2fname(url) + "_unspanned_tables.md"), "w", encoding="utf-8") as file:
                         file.write(''.join(result_list))
 
+                # mdディレクトリへrawマークダウンを保存
+                if os.getenv("EXCLUDE_RAW_MARKDOWN", "false").lower() == "true":
+                    print("Skipping saving raw markdown as per EXCLUDE_RAW_MARKDOWN setting.")
+                else:
+                    with open("{}/md/{}".format(output_dir, url2fname(url) + "_raw.md"), "w") as file:
+                        file.write(result.markdown)
+
                 # 出力ディレクトリ直下へcleaned HTML and JSONを保存
-                if os.getenv("EXCUDE_CLEANED_HTML", "false").lower() == "true":
-                    print("Skipping saving cleaned HTML as per EXCUDE_CLEANED_HTML setting.")
+                if os.getenv("EXCLUDE_CLEANED_HTML", "false").lower() == "true":
+                    print("Skipping saving cleaned HTML as per EXCLUDE_CLEANED_HTML setting.")
                 else:
                     with open("{}/{}".format(output_dir, url2fname(url) + ".html"), "w") as file:
                         # file.write(result.cleaned_html)
                         file.write(result.html)
 
-                if os.getenv("EXCUDE_JSON", "false").lower() == "true":
-                    print("Skipping saving JSON as per EXCUDE_JSON setting.")
+                if os.getenv("EXCLUDE_JSON", "false").lower() == "true":
+                    print("Skipping saving JSON as per EXCLUDE_JSON setting.")
                 else:
                     with open("{}/{}".format(output_dir, url2fname(url) + ".json"), "w", encoding="utf-8") as file:
                         file.write(json.dumps(result_json, indent=2, ensure_ascii=False))
@@ -203,10 +333,11 @@ async def crawl(input_file='urls.txt', output_dir='output_crawled'):
                 if i > 0 and i % 10 == 0:
                     await asyncio.sleep(0.5)               
 
+                print(f"Processed {i+1}/{len(urls)}: {url}")
             except Exception as e:
                 print(f"Error processing {url}: {e}")
-                exit(1)          
-
+                raise e
+    
 def main():
     """Main function to handle command line arguments."""
     parser = argparse.ArgumentParser(
@@ -227,7 +358,6 @@ def main():
     output_dir = args.output_dir
 
     asyncio.run(crawl(input_file=input_file, output_dir=output_dir))
-    exit(0)
 
 if __name__ == "__main__":
     main()
