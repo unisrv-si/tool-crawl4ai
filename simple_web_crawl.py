@@ -10,10 +10,8 @@ import argparse
 from pathlib import Path
 from dotenv import load_dotenv
 from table_unspanner import TableUnspanner
-
+from loguru import logger
 load_dotenv()
-
-# crawler = AsyncWebCrawler()
 
 config = CrawlerRunConfig(
     # Content thresholds
@@ -34,13 +32,31 @@ config = CrawlerRunConfig(
     exclude_external_links=False,    
     exclude_social_media_links=False,
     # Block entire domains
-    # exclude_domains=["adtrackers.com", "spammynews.org"],    
+    exclude_domains=["adservice.google.com", "adtrackers.com", "spammynews.org"],    
     exclude_social_media_domains=["facebook.com", "x.com"],
 
     # Media filtering
     exclude_external_images=False,
 )
 import re
+def _asahi_beer_fix_asterisk_only_in_markdown(markdown_text) -> str:
+    """ Fix lines that contain only asterisks and spaces which may break markdown formatting.
+    """
+    fixed_text = re.sub(r'^\s{2}\* \n', '', markdown_text, flags=re.MULTILINE)
+    return fixed_text
+def _asahi_beer_fix_two_asterisks_in_markdown(markdown_text) -> str:
+    fixed_text = re.sub(r'^\s{2}\*\s{5}\*', '    *', markdown_text, flags=re.MULTILINE)
+    return fixed_text
+def _asahi_beer_remove_asterisk_of_heading_links(markdown_text) -> str:
+    """
+    Docstring for _asahi_beer_remove_asterisk_of_heading_links
+    [before]
+        * ![合うお酒](https://...
+    [after]
+        ![合うお酒](https://...
+    """
+    fixed_text = re.sub(r'^\s{2}\* (!\[)', r'\n\1', markdown_text, flags=re.MULTILINE)
+    return fixed_text
 
 def _kewpie_fix_markdown_table_linebreaks(markdown_text):
     """Fix line breaks in markdown tables
@@ -89,6 +105,16 @@ def _kewpie_fix_table_markdown(md_text):
     """ Fix markdown tables from kewpie site where some rows have missing columns.
         材料セクションのテーブルの列数を揃える。"A"が列の先頭に存在するため、Craawl4AIのテーブル抽出ロジックが正しく列数を認識できないため。
     """
+    def matches_ingredient_header(line):
+        patterns = [r'^#+ .*材料（[0-9０-９]+人分）', 
+                    r'^#+ .*つけあわせ'
+                ]
+
+        for pattern in patterns:
+            if re.match(pattern, line):
+                return True
+        return False
+
     # Split into lines
     lines = md_text.split('\n')
     
@@ -100,11 +126,14 @@ def _kewpie_fix_table_markdown(md_text):
     
     ingredients_section = False
     max_cols = 0
+    
+    # Rebuild with consistent columns
     for line in lines:
-        if line.startswith('### 材料'):
+        if matches_ingredient_header(line):
+            cells = [c.strip() for c in line.split('|')]
+
             ingredients_section = True
             continue  # Skip this line
-        
         if ingredients_section:
             if '|' in line:
                 cells = [c.strip() for c in line.split('|')]
@@ -112,17 +141,14 @@ def _kewpie_fix_table_markdown(md_text):
                     max_cols = len(cells)
             else:
                 ingredients_section = False
+            break  # Only need to determine max_cols once
 
-
-    # print(f"Max columns in ingredients table: {max_cols}")
-
-
-
-    # Rebuild with consistent columns
+    logger.debug(f"Determined max columns in ingredients table: {max_cols}")
+        
     fixed_lines = []
     ingredients_section = False
     for line in lines:
-        if line.startswith('### 材料'):
+        if matches_ingredient_header(line):
             ingredients_section = True
             fixed_lines.append(line)
             continue  # Skip this line
@@ -133,9 +159,12 @@ def _kewpie_fix_table_markdown(md_text):
                 # print(f"Original cells: {cells}")
                 # Pad to max_cols + 2 (for leading/trailing |)
                 # while len(cells) < max_cols + 2:
+                logger.debug(f"Fixing line: {line} with {len(cells)} cells.")
                 while len(cells) < max_cols + 1:
-                    cells.append('')
-                fixed_lines.append('| ' + ' | '.join(cells[1:-1]) + ' |')
+                    cells.append('<sp>')
+                logger.debug(f"cells[0:-1]: {cells[0:-1]}") 
+                # fixed_lines.append('| ' + ' | '.join(cells[1:-1]) + ' |')
+                fixed_lines.append('| ' + ' | '.join(cells[0:-1]) + ' |')
             else:
                 ingredients_section = False
                 fixed_lines.append(line)
@@ -208,42 +237,52 @@ def adjust_numbered_lists(markdown_text: str) -> str:
     - Preserves existing proper format (1. already formatted)
     - Ignores numbers in middle of lines
     """
+    def matched_unformatted_number(line: str) -> bool:
+        """ 
+        以下のようなパターンはマッチの除外する。
+        1の...　-> 1.の [NG]
+        1か(1から) -> 1.か [NG]
+        [格助詞] 1の, 1が, 1を, 1に, 1へ, 1と, 1から, 1より, 1まで 
+        [副助詞] 1も, 1は, 1だけ, 1しか, 1こそ, 1でも, 1ずつ
+        [接続助詞] 1で, 1なら
+        [接尾辞的な語] 1人, 1個, 1本, 1枚, 1羽, 1台, 1回, 1番, 1日, 1年, 1ページ, 1グラム, 1cc, 1g, 1kg
+            """
+        pattern = r'^(\d+)([^\.\s/\+\-*%\^<>\[\]\(\)のがをにへとかよまもはだしこでずなつ個本枚羽台回番日年度ペキグcg])'
+        
+        matched = re.match(pattern, line)
+        if matched:
+            return matched
+        return None
+
     lines = markdown_text.split('\n')
     adjusted_lines = []
     
     for line in lines:
-        stripped = line.lstrip()
-        leading_space = line[:len(line) - len(stripped)]
+        stripped_line = line.lstrip()
+        leading_space = line[:len(line) - len(stripped_line)]
         
         # Pattern: starts with digit(s), no dot/space after, followed by content
-        matched = re.match(r'^(\d+)([^\.\s/\+\-*%\^<>\[\]\(\)])', stripped, re.ASCII)
-        
+        matched = matched_unformatted_number(stripped_line)
         if matched:
+            logger.debug(f"Line: {line} Matched: {matched}") 
             number = matched.group(1)
-            rest = stripped[len(number):]
-            adjusted_line = f"{leading_space}{number}. {rest}"
+            rest = stripped_line[len(number):]
+            adjusted_line = f"\n{leading_space}{number}. {rest}"
             adjusted_lines.append(adjusted_line)
         else:
             adjusted_lines.append(line)
     return '\n'.join(adjusted_lines)
 
 def adjust_markdown(markdown: str) -> str:
-                        # adjust_numbered_lists(
-                        #     remove_javascript_void_zero(
-                        #         fix_markdown_table_linebreaks(
-                        #             kewpie_fix_table_markdown(
-                        #                     fix_markdown_table_linebreaks(result.markdown)
-                        #             )
-                        #         )
-                        #     )
-                        # )
-
 
     list_of_functions = [
-        _kewpie_fix_markdown_table_linebreaks,
-        _kewpie_fix_table_markdown,
-        remove_javascript_void_zero,
-        adjust_numbered_lists,
+        # _kewpie_fix_markdown_table_linebreaks,
+        # _kewpie_fix_table_markdown,
+        # remove_javascript_void_zero,
+        # adjust_numbered_lists,
+        _asahi_beer_fix_asterisk_only_in_markdown,
+        _asahi_beer_fix_two_asterisks_in_markdown,
+        _asahi_beer_remove_asterisk_of_heading_links,
     ]
     for func in list_of_functions:
         markdown = func(markdown)
@@ -265,6 +304,8 @@ async def crawl(input_file='urls.txt', output_dir='output_crawled'):
         Path(output_dir).mkdir(parents=True, exist_ok=True)
     # AsyncWebCrawlerは、Single browser instanceとして動作するため、複数のインスタスを生成すると
     # リソース逼迫によりハングアップするため、urlsのループ内で生成しないこと。
+    # Crawl4AIの現時点(2025-12)の最新 v 0.7.8では、大量のURLをクロールする場合に、リソースのリークが発生していると思われ、
+    # すべてのURLをクロールし終えた後に正常終了せずにハングアップすることがある。
     async with AsyncWebCrawler() as crawler:
         for i, url in enumerate(urls):
             try:

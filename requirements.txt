@@ -2,7 +2,8 @@
 Crawl4AI==0.7.8
 markdownify==1.2.2
 python-dotenv==1.2.1
-
+loguru==0.7.3
+pandas==3.0.0
 
 # インストール後、crawl4ai-setupを実行してください。Crawl4AIが利用するplaywrightもインストールされます。
 # 別途playwrightをインストールする場合は、 playwright install 
